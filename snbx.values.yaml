@@ -1,0 +1,668 @@
+# Local environment overrides merged on top of base.values.yaml
+
+#clusterDomain: bouc.io
+clusterDomain: ${CLUSTER_DOMAIN}
+
+## @param extraDeploy Array of extra objects to deploy with the release
+##
+extraDeploy: #[]
+  - |
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: keycloak-oauthproxy-sync
+      namespace: keycloak
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: keycloak-oauthproxy-sync
+    rules:
+      - apiGroups: [""]
+        resources: ["secrets"]
+        verbs: ["get", "create", "update", "patch"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: keycloak-oauthproxy-sync
+    subjects:
+      - kind: ServiceAccount
+        name: keycloak-oauthproxy-sync
+        namespace: keycloak
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: keycloak-oauthproxy-sync
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: keycloak-oauthproxy-sync
+      namespace: keycloak
+      annotations:
+        helm.sh/hook: post-install,post-upgrade
+        helm.sh/hook-weight: "15"
+        helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+        sidecar.istio.io/inject: "false"
+    spec:
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: keycloak-oauthproxy-sync
+          volumes:
+            - name: shared
+              emptyDir: {}
+            - name: homedir
+              emptyDir: {}
+          containers:
+            - name: fetch-secret
+              image: docker.io/bitnamilegacy/keycloak:26.3.2
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -uo pipefail
+                  KCADM=/opt/bitnami/keycloak/bin/kcadm.sh
+                  echo "DEBUG: Authenticating..."
+                  $${KCADM} config credentials \
+                    --server "$${KC_SERVER_URL}" \
+                    --realm "$${KC_ADMIN_REALM}" \
+                    --user "$${KC_USER}" \
+                    --password "$${KC_PASSWORD}"
+
+                  echo "[oauthproxy-sync] Resolving client '$${OAUTHPROXY_CLIENT_ID}' in realm '$${KC_REALM}'"
+                  CLIENT_ID_LINE=$($${KCADM} get clients -r "$${KC_REALM}" -q clientId="$${OAUTHPROXY_CLIENT_ID}" --fields id | awk -F'"' '/"id" *:/ {print $4; exit}')
+                  echo "DEBUG: Found Client ID UUID: '$${CLIENT_ID_LINE}'"
+
+                  if [ -z "$${CLIENT_ID_LINE}" ]; then
+                    echo "[oauthproxy-sync] Client $${OAUTHPROXY_CLIENT_ID} not found"; exit 1
+                  fi
+
+                  echo "[oauthproxy-sync] Fetching existing client secret"
+                  echo "DEBUG: Running: $${KCADM} get clients/$${CLIENT_ID_LINE}/client-secret -r $${KC_REALM}"
+
+                  # Capture stderr too
+                  SECRET_JSON=$($${KCADM} get clients/$${CLIENT_ID_LINE}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                  echo "DEBUG: JSON received: '$${SECRET_JSON}'"
+
+                  # Use the fixed sed regex
+                  SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+                  echo "DEBUG: Parsed Secret Value: '$${SECRET_VALUE}'"
+
+                  if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                    echo "[oauthproxy-sync] Existing secret unavailable or masked; requesting regeneration"
+
+                    echo "DEBUG: Running: $${KCADM} create clients/$${CLIENT_ID_LINE}/client-secret -r $${KC_REALM}"
+                    SECRET_JSON=$($${KCADM} create clients/$${CLIENT_ID_LINE}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                    echo "DEBUG: Regeneration JSON received: '$${SECRET_JSON}'"
+
+                    SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+                    echo "DEBUG: Parsed Regenerated Secret Value: '$${SECRET_VALUE}'"
+
+                    if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                      echo "[oauthproxy-sync] Regeneration did not return a value; retrying fetch"
+                      SECRET_JSON=$($${KCADM} get clients/$${CLIENT_ID_LINE}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                      echo "DEBUG: Retry JSON received: '$${SECRET_JSON}'"
+                      SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+                    fi
+                  fi
+
+                  if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                    echo "[oauthproxy-sync] Client secret empty or masked after regeneration attempts"; exit 1
+                  fi
+
+                  echo "[oauthproxy-sync] Client secret obtained (length $${#SECRET_VALUE})"
+                  echo "[oauthproxy-sync] Writing Kubernetes Secret manifest '$${OAUTHPROXY_SECRET_NAME}' in namespace '$${TARGET_NAMESPACE}'"
+                  cat <<EOF >/shared/secret.yaml
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: $${OAUTHPROXY_SECRET_NAME}
+                    namespace: $${TARGET_NAMESPACE}
+                  type: Opaque
+                  stringData:
+                    clientID: "$${OAUTHPROXY_CLIENT_ID}"
+                    client-id: "$${OAUTHPROXY_CLIENT_ID}"
+                    clientSecret: "$${SECRET_VALUE}"
+                    client-secret: "$${SECRET_VALUE}"
+                    cookieSecret: "$${OAUTHPROXY_COOKIE_SECRET}"
+                    cookie-secret: "$${OAUTHPROXY_COOKIE_SECRET}"
+                    OAUTHPROXY_CLIENT_SECRET: "$${SECRET_VALUE}"
+                  EOF
+                  cat <<EOF >/shared/secret-oauth2.yaml
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: $${OAUTHPROXY_SECRET_NAME}
+                    namespace: oauth2-proxy
+                  type: Opaque
+                  stringData:
+                    clientID: "$${OAUTHPROXY_CLIENT_ID}"
+                    client-id: "$${OAUTHPROXY_CLIENT_ID}"
+                    clientSecret: "$${SECRET_VALUE}"
+                    client-secret: "$${SECRET_VALUE}"
+                    cookieSecret: "$${OAUTHPROXY_COOKIE_SECRET}"
+                    cookie-secret: "$${OAUTHPROXY_COOKIE_SECRET}"
+                    OAUTH2_PROXY_CLIENT_SECRET: "$${SECRET_VALUE}"
+                  EOF
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: KC_SERVER_URL
+                  value: http://keycloak-release-headless:8080
+                - name: KC_ADMIN_REALM
+                  value: master
+                - name: KC_REALM
+                  value: users
+                - name: OAUTHPROXY_CLIENT_ID
+                  value: oauth2-proxy
+                - name: OAUTHPROXY_SECRET_NAME
+                  value: oauthproxy-client-secret
+                - name: OAUTHPROXY_COOKIE_SECRET
+                  value: "CHANGE_ME_CHANGE_ME_CHANGE_ME_00"
+                - name: TARGET_NAMESPACE
+                  value: keycloak
+                - name: KC_USER
+                  value: admin
+                - name: KC_PASSWORD
+                  value: CHANGE_ME
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                - name: homedir
+                  mountPath: /home/keycloak
+            - name: apply-secret
+              image: docker.io/bitnamilegacy/kubectl:1.30
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  for i in $(seq 1 30); do
+                    if [ -f /shared/secret.yaml ]; then
+                      kubectl apply -f /shared/secret.yaml
+                      kubectl apply -f /shared/secret-oauth2.yaml
+                      exit 0
+                    fi
+                    sleep 2
+                  done
+                  echo "secret.yaml not found after waiting"; exit 1
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                - name: homedir
+                  mountPath: /home/keycloak
+  # kiali-client sync. Same technique as the oauth2-proxy block above: Keycloak is the source of
+  # truth for the OIDC client secret, so nothing has to be pre-seeded on a cold bootstrap. This
+  # client lives in the MASTER realm (Kiali issuer_uri and all three Grafana OAuth URLs point at
+  # /realms/master) and is NOT in any realm export, so the job creates it when absent. One value
+  # fans out to two namespaces because Grafana deliberately reuses kiali-client.
+  #
+  # Escaping: this file is delivered through a Flux configMapGenerator with
+  # postBuild.substituteFrom, so Flux runs envsubst over it. Shell variables MUST be written
+  # $${VAR}; a single ${VAR} is consumed by Flux (that is how ${CLUSTER_DOMAIN} works, and it is
+  # confined to the env: block below). No literal Go-template braces anywhere: Bitnami pushes
+  # extraDeploy strings through Helm tpl.
+  #
+  # Post-Bitnami note: extraDeploy is Bitnami-chart-specific and has no equivalent in keycloakx or
+  # the Keycloak Operator. On that migration this becomes a standalone manifest in a Flux
+  # Kustomization, hook weights 15/20 become dependsOn ordering, and the two bitnamilegacy images
+  # move to quay.io/keycloak/keycloak (kcadm at /opt/keycloak/bin/kcadm.sh) and a kubectl image.
+  - |
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: keycloak-kiali-sync
+      namespace: keycloak
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: keycloak-kiali-sync
+    rules:
+      - apiGroups: [""]
+        resources: ["secrets"]
+        verbs: ["get", "create", "update", "patch", "delete"]
+      - apiGroups: ["apps"]
+        resources: ["deployments"]
+        resourceNames: ["kiali", "grafana"]
+        verbs: ["get", "patch"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: keycloak-kiali-sync
+    subjects:
+      - kind: ServiceAccount
+        name: keycloak-kiali-sync
+        namespace: keycloak
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: keycloak-kiali-sync
+    ---
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: keycloak-kiali-sync
+      namespace: keycloak
+      annotations:
+        helm.sh/hook: post-install,post-upgrade
+        helm.sh/hook-weight: "20"
+        helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+        sidecar.istio.io/inject: "false"
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: keycloak-kiali-sync
+          volumes:
+            - name: shared
+              emptyDir: {}
+            - name: homedir
+              emptyDir: {}
+          containers:
+            - name: fetch-secret
+              image: docker.io/bitnamilegacy/keycloak:26.3.2
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -uo pipefail
+                  KCADM=/opt/bitnami/keycloak/bin/kcadm.sh
+
+                  # The HelmRelease sets install/upgrade disableWait, so Helm fires post-install
+                  # hooks immediately and Keycloak may not be serving yet.
+                  AUTH_OK=no
+                  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                    if $${KCADM} config credentials \
+                         --server "$${KC_SERVER_URL}" \
+                         --realm "$${KC_ADMIN_REALM}" \
+                         --user "$${KC_USER}" \
+                         --password "$${KC_PASSWORD}"; then
+                      AUTH_OK=yes; break
+                    fi
+                    echo "[kiali-sync] Keycloak not ready yet (attempt $${attempt}/12); sleeping 10s"
+                    sleep 10
+                  done
+                  if [ "$${AUTH_OK}" != "yes" ]; then
+                    echo "[kiali-sync] Could not authenticate to Keycloak"; exit 1
+                  fi
+
+                  echo "[kiali-sync] Resolving client '$${OIDC_CLIENT_ID}' in realm '$${KC_REALM}'"
+                  CID=$($${KCADM} get clients -r "$${KC_REALM}" -q clientId="$${OIDC_CLIENT_ID}" --fields id | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+
+                  if [ -z "$${CID}" ]; then
+                    echo "[kiali-sync] Client absent; creating it in realm $${KC_REALM}"
+                    $${KCADM} create clients -r "$${KC_REALM}" \
+                      -s clientId="$${OIDC_CLIENT_ID}" \
+                      -s name="Kiali and Grafana (OIDC)" \
+                      -s enabled=true \
+                      -s protocol=openid-connect \
+                      -s publicClient=false \
+                      -s bearerOnly=false \
+                      -s clientAuthenticatorType=client-secret \
+                      -s standardFlowEnabled=true \
+                      -s implicitFlowEnabled=false \
+                      -s directAccessGrantsEnabled=false \
+                      -s serviceAccountsEnabled=false \
+                      -s frontchannelLogout=true \
+                      -s "redirectUris=[\"$${KIALI_REDIRECT_URI}\",\"$${GRAFANA_REDIRECT_URI}\"]" \
+                      -s "webOrigins=[\"$${KIALI_WEB_ORIGIN}\",\"$${GRAFANA_WEB_ORIGIN}\"]" || true
+                    CID=$($${KCADM} get clients -r "$${KC_REALM}" -q clientId="$${OIDC_CLIENT_ID}" --fields id | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+                  else
+                    # Pre-existing client: report only, never rewrite. A declarative overwrite would
+                    # silently drop redirect URIs added by hand in the admin console.
+                    echo "[kiali-sync] Client already exists (UUID '$${CID}'); leaving its configuration untouched"
+                    REDIRECTS=$($${KCADM} get clients/$${CID} -r "$${KC_REALM}" --fields redirectUris 2>&1 || true)
+                    echo "[kiali-sync] Current redirectUris: $${REDIRECTS}"
+                    case "$${REDIRECTS}" in
+                      *kiali*) : ;;
+                      *) echo "[kiali-sync] WARNING: no Kiali redirect URI ($${KIALI_REDIRECT_URI}) on this client; Kiali login will fail" ;;
+                    esac
+                    case "$${REDIRECTS}" in
+                      *grafana*) : ;;
+                      *) echo "[kiali-sync] WARNING: no Grafana redirect URI ($${GRAFANA_REDIRECT_URI}) on this client; Grafana login will fail" ;;
+                    esac
+                  fi
+
+                  if [ -z "$${CID}" ]; then
+                    echo "[kiali-sync] Client $${OIDC_CLIENT_ID} could not be created or resolved"; exit 1
+                  fi
+
+                  echo "[kiali-sync] Fetching existing client secret"
+                  SECRET_JSON=$($${KCADM} get clients/$${CID}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                  SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+
+                  if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                    echo "[kiali-sync] Existing secret unavailable or masked; requesting regeneration"
+                    SECRET_JSON=$($${KCADM} create clients/$${CID}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                    SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+
+                    if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                      echo "[kiali-sync] Regeneration did not return a value; retrying fetch"
+                      SECRET_JSON=$($${KCADM} get clients/$${CID}/client-secret -r "$${KC_REALM}" 2>&1 || true)
+                      SECRET_VALUE=$(echo "$${SECRET_JSON}" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+                    fi
+                  fi
+
+                  if [ -z "$${SECRET_VALUE}" ] || [ "$${SECRET_VALUE}" = "**********" ]; then
+                    echo "[kiali-sync] Client secret empty or masked after regeneration attempts"; exit 1
+                  fi
+
+                  echo "[kiali-sync] Client secret obtained (length $${#SECRET_VALUE})"
+                  # Quoted single-line stringData on purpose: Kiali reads /kiali-secret/oidc-secret
+                  # with no trimming, so a trailing newline yields an invalid_client at login.
+                  cat <<EOF >/shared/kiali-secret.yaml
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: kiali
+                    namespace: kiali
+                  type: Opaque
+                  stringData:
+                    oidc-secret: "$${SECRET_VALUE}"
+                  EOF
+                  cat <<EOF >/shared/grafana-secret.yaml
+                  apiVersion: v1
+                  kind: Secret
+                  metadata:
+                    name: grafana-oauth
+                    namespace: grafana
+                  type: Opaque
+                  stringData:
+                    client-secret: "$${SECRET_VALUE}"
+                  EOF
+                  # Written last so the applier cannot race a half-written manifest.
+                  touch /shared/READY
+                  echo "[kiali-sync] Manifests written for kiali/oidc-secret and grafana-oauth/client-secret"
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: KC_SERVER_URL
+                  value: http://keycloak-release-headless:8080
+                - name: KC_ADMIN_REALM
+                  value: master
+                - name: KC_REALM
+                  value: master
+                - name: KC_USER
+                  value: admin
+                - name: KC_PASSWORD
+                  value: CHANGE_ME
+                - name: OIDC_CLIENT_ID
+                  value: kiali-client
+                - name: KIALI_REDIRECT_URI
+                  value: "https://kiali.${CLUSTER_DOMAIN}/*"
+                - name: GRAFANA_REDIRECT_URI
+                  value: "https://grafana.${CLUSTER_DOMAIN}/*"
+                - name: KIALI_WEB_ORIGIN
+                  value: "https://kiali.${CLUSTER_DOMAIN}"
+                - name: GRAFANA_WEB_ORIGIN
+                  value: "https://grafana.${CLUSTER_DOMAIN}"
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                - name: homedir
+                  mountPath: /home/keycloak
+            - name: apply-secret
+              image: docker.io/bitnamilegacy/kubectl:1.30
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  for i in $(seq 1 30); do
+                    if [ -f /shared/READY ]; then
+                      # Delete-then-create, not patch: the Secrets may still carry an ownerReference
+                      # from the retired boucio-kiali-oidc / boucio-grafana-oauth ExternalSecrets,
+                      # and a later ESO prune would garbage-collect whatever we wrote into them.
+                      kubectl -n kiali delete secret kiali --ignore-not-found
+                      kubectl -n grafana delete secret grafana-oauth --ignore-not-found
+                      kubectl apply -f /shared/kiali-secret.yaml
+                      kubectl apply -f /shared/grafana-secret.yaml
+                      # Both consumers read the value once at start (Grafana as a secretKeyRef env
+                      # var, Kiali as a file at process start), so a restart is mandatory. Tolerate
+                      # absence: on a cold bootstrap those HelmReleases may not have reconciled yet.
+                      kubectl -n kiali rollout restart deployment/kiali || echo "[kiali-sync] kiali deployment absent; skipping restart"
+                      kubectl -n grafana rollout restart deployment/grafana || echo "[kiali-sync] grafana deployment absent; skipping restart"
+                      exit 0
+                    fi
+                    sleep 2
+                  done
+                  echo "[kiali-sync] /shared/READY not found after waiting"; exit 1
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+                - name: homedir
+                  mountPath: /home/keycloak
+
+## Keycloak authentication parameters
+## ref: https://github.com/bitnami/containers/tree/main/bitnami/keycloak#admin-credentials
+##
+auth:
+  ## @param auth.adminUser Keycloak administrator user
+  ##
+  adminUser: "admin"
+  ## @param auth.adminPassword Keycloak administrator password for the new user
+  ##
+  adminPassword: "CHANGE_ME"
+  ## @param auth.existingSecret Existing secret containing Keycloak admin password
+  ##
+  existingSecret: ""
+  ## @param auth.passwordSecretKey Key where the Keycloak admin password is being stored inside the existing secret.
+  ##
+  passwordSecretKey: "password"
+  ## @param auth.annotations Additional custom annotations for Keycloak auth secret object
+  ##
+  annotations: {}
+
+## @param adminRealm Name of the admin realm
+##
+adminRealm: "master"
+
+extraEnvVars: #[]
+  #- name: KC_HOSTNAME
+  #  value: "sso.bouc.io"
+  - name: KC_PROXY_HEADERS
+    value: xforwarded
+  #- name: KC_PROXY
+  #  value: edge # still valid; new name satisfies the warning
+  #- name: KEYCLOAK_PROXY_ADDRESS_FORWARDING
+  #  value: "true"
+  #- name: KC_PROXY_ADDRESS_FORWARDING
+  #  value: "true"
+  #- name: KEYCLOAK_FRONTEND_URL
+  #  value: "https://sso.bouc.io/"
+  - name: KC_HOSTNAME
+    value: sso.${CLUSTER_DOMAIN}
+  #- name: KC_HOSTNAME_URL # Required otherwise KC frontend tries to display insecure content.
+  #  value: "https://sso.${CLUSTER_DOMAIN}/"
+  #- name: KC_HOSTNAME_ADMIN_URL # Required otherwise KC frontend switch to HTTP while reaching the admin console.
+  #  value: "https://sso.${CLUSTER_DOMAIN}/"
+  #- name: KC_HOSTNAME_PORT
+  #  value: "8080"
+  - name: KC_HOSTNAME_STRICT # Replaces the two KC_HOSTAME_URL and _ADMIN_URL above, leveraging the hostname from the header.
+    #value: "false" # In Production, the two KC_HOSTNAME_ should be set instead for security reasons.
+    value: "true"
+  #- name: KC_HOSTNAME_STRICT_HTTPS
+  #  value: "false"
+  - name: KC_HOSTNAME_STRICT_HTTPS
+    value: "true"
+  - name: KEYCLOAK_PROFILE_FEATURE_SAMESITE_COOKIE_SUPPORT
+    value: enabled
+  - name: KEYCLOAK_SAMESITE_COOKIE_MODE
+    value: none
+  - name: KEYCLOAK_SAMESITE_COOKIE_SECURE
+    value: "true"
+  - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+    value: "false"
+  # - name: KEYCLOAK_ADMIN
+  #   value: admin
+  # - name: KEYCLOAK_ADMIN_PASSWORD
+  #   value: admin
+  # - name: KEYCLOAK_ADMIN_PASSWORD_FILE
+  #   value: /opt/bitnami/keycloak/secrets/admin-password
+  # TODO: To remove those environment variables eventually, not safe!
+  - name: KC_BOOTSTRAP_ADMIN_USERNAME
+    value: admin
+  - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+    value: CHANGE_ME
+  - name: KC_CACHE
+    value: local
+  #- name: KC_CACHE_STACK # Only available when cache is set to 'ispn'
+  #  value: kubernetes
+
+## @param extraStartupArgs Extra default startup args
+##
+extraStartupArgs: "--cache=local --verbose"
+
+## Configuration for keycloak-config-cli
+## ref: https://github.com/adorsys/keycloak-config-cli
+##
+keycloakConfigCli:
+  ## @param keycloakConfigCli.existingConfigmap ConfigMap with keycloak-config-cli configuration
+  ## NOTE: This will override keycloakConfigCli.configuration
+  ##
+  existingConfigmap: "keycloak-users-realm"
+
+  ## @param keycloakConfigCli.hostAliases Job pod host aliases
+  ## https://kubernetes.io/docs/concepts/services-networking/add-entries-to-pod-etc-hosts-with-host-aliases/
+  ##
+  hostAliases: []
+    #- ip: 10.101.189.163 # ClusterIP or load balancer IP of istio-ingressgateway
+    #  hostnames:
+    #    - sso.${CLUSTER_DOMAIN}
+
+  ## @param keycloakConfigCli.podAnnotations Annotations for job pod
+  ## ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
+  ##
+  podAnnotations: { sidecar.istio.io/inject: "false" }
+
+  ## @param keycloakConfigCli.extraEnvVars Additional environment variables to set
+  ## Example:
+  ## extraEnvVars:
+  ##   - name: FOO
+  ##     value: "bar"
+  ##
+  extraEnvVars: #[]
+    # KEYCLOAK_URL is already set by the chart's keycloak-config-cli-job.yaml template,
+    # which appends extraEnvVars after its own env entries. Setting it here produced a
+    # second env entry with the same name, and server-side apply keys env[] by name, so
+    # the post-install hook failed with "duplicate entries for key [name=KEYCLOAK_URL]".
+    # The chart derives the same in-cluster URL, so the override is redundant.
+    # Kept commented to mirror lcl.values.yaml.
+    #- name: KEYCLOAK_URL
+    #  value: http://keycloak-release.keycloak.svc.cluster.local
+    #  value: https://sso.${CLUSTER_DOMAIN}
+    - name: KEYCLOAK_SSL_VERIFY
+      value: "false"
+    - name: KC_CACHE
+      value: local
+    - name: KEYCLOAK_CACHE
+      value: local
+    #- name: KEYCLOAK_CACHE_STACK # Only available when cache is set to 'ispn'
+    #  value: kubernetes
+
+## PostgreSQL chart configuration
+## ref: https://github.com/bitnami/charts/blob/main/bitnami/postgresql/values.yaml
+## @param postgresql.enabled Switch to enable or disable the PostgreSQL helm chart
+## @param postgresql.auth.postgresPassword Password for the "postgres" admin user. Ignored if `auth.existingSecret` with key `postgres-password` is provided
+## @param postgresql.auth.username Name for a custom user to create
+## @param postgresql.auth.password Password for the custom user to create
+## @param postgresql.auth.database Name for a custom database to create
+## @param postgresql.auth.existingSecret Name of existing secret to use for PostgreSQL credentials
+## @param postgresql.auth.secretKeys.userPasswordKey Name of key in existing secret to use for PostgreSQL credentials. Only used when `auth.existingSecret` is set.
+## @param postgresql.architecture PostgreSQL architecture (`standalone` or `replication`)
+##
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: "CHANGE_ME"
+    username: bn_keycloak
+    password: "CHANGE_ME"
+    database: bitnami_keycloak
+    existingSecret: ""
+    secretKeys:
+      userPasswordKey: password
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/postgresql
+    tag: 17.5.0-debian-12-r18
+  architecture: standalone
+  primary:
+    networkPolicy:
+      # Istio's injector adds prometheus.io scrape annotations for the sidecar's merged-metrics
+      # port (15020). The Bitnami policy only allows 5432, so Prometheus scrapes time out (up=0).
+      extraIngress:
+        - ports:
+            - port: 15020
+              protocol: TCP
+          from:
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: prometheus
+
+## External PostgreSQL configuration
+## All of these values are only used when postgresql.enabled is set to false
+## @param externalDatabase.host Database host
+## @param externalDatabase.port Database port number
+## @param externalDatabase.user Non-root username for Keycloak
+## @param externalDatabase.password Password for the non-root username for Keycloak
+## @param externalDatabase.database Keycloak database name
+## @param externalDatabase.existingSecret Name of an existing secret resource containing the database credentials
+## @param externalDatabase.existingSecretHostKey Name of an existing secret key containing the database host name
+## @param externalDatabase.existingSecretPortKey Name of an existing secret key containing the database port
+## @param externalDatabase.existingSecretUserKey Name of an existing secret key containing the database user
+## @param externalDatabase.existingSecretDatabaseKey Name of an existing secret key containing the database name
+## @param externalDatabase.existingSecretPasswordKey Name of an existing secret key containing the database credentials
+## @param externalDatabase.annotations Additional custom annotations for external database secret object
+##
+# externalDatabase:
+#   host: ""
+#   port: 5432
+#   user: bn_keycloak
+#   database: bitnami_keycloak
+#   password: ""
+#   existingSecret: ""
+#   existingSecretHostKey: ""
+#   existingSecretPortKey: ""
+#   existingSecretUserKey: ""
+#   existingSecretDatabaseKey: ""
+#   existingSecretPasswordKey: ""
+#   annotations: {}
+## @section Keycloak Cache parameters
+
+## Keycloak cache configuration
+## ref: https://www.keycloak.org/server/caching
+## @param cache.enabled Switch to enable or disable the Keycloak distributed cache for kubernetes.
+## NOTE: Set to false to use 'local' cache (only supported when replicaCount=1).
+## @param cache.stack Cache stack to use
+## @param cache.configFile Path to the file from which cache configuration should be loaded from
+## @param cache.useHeadlessServiceWithAppVersion Create a headless service used for ispn containing the app version
+## @param cache.javaOptsAppendExtra Extra java options to append to the java options
+##
+cache:
+  enabled: true
+  stack: jdbc-ping
+  configFile: "cache-ispn.xml"
+  useHeadlessServiceWithAppVersion: false
+  javaOptsAppendExtra: ""
+## Keycloak logging configuration
+## ref: https://www.keycloak.org/server/logging
+## @param logging.output Alternates between the default log output format or json format
+## @param logging.level Allowed values as documented: FATAL, ERROR, WARN, INFO, DEBUG, TRACE, ALL, OFF
+##
+logging:
+  output: default
+  level: INFO
